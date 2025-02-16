@@ -16,6 +16,68 @@ private struct HFInferenceResponse: Decodable {
     let image: String?
 }
 
+/// A simple storage manager that handles saving and loading sticker images.
+class StickerStorageManager {
+    static let shared = StickerStorageManager()
+    let stickersDirectory: URL
+
+    private init() {
+        let fileManager = FileManager.default
+        // Get the Documents directory.
+        let documentsURL = fileManager.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        stickersDirectory = documentsURL.appendingPathComponent("Stickers")
+        // Create the folder if it doesn't exist.
+        if !fileManager.fileExists(atPath: stickersDirectory.path) {
+            do {
+                try fileManager.createDirectory(at: stickersDirectory, withIntermediateDirectories: true, attributes: nil)
+            } catch {
+                print("Error creating stickers directory: \(error)")
+            }
+        }
+    }
+
+    /// Saves the given image with the specified UUID.
+    func saveSticker(image: UIImage, id: UUID) {
+        let fileURL = stickersDirectory.appendingPathComponent("\(id.uuidString).png")
+        if let data = image.pngData() {
+            do {
+                try data.write(to: fileURL)
+            } catch {
+                print("Error saving sticker image: \(error)")
+            }
+        }
+    }
+
+    /// Loads all saved stickers from the stickers directory.
+    func loadStickers() -> [GeneratedImage] {
+        var images = [GeneratedImage]()
+        do {
+            let fileURLs = try FileManager.default.contentsOfDirectory(at: stickersDirectory, includingPropertiesForKeys: nil)
+            // Sort files by creation date (newest first).
+            let sortedURLs = fileURLs.sorted {
+                let attr0 = try? FileManager.default.attributesOfItem(atPath: $0.path)
+                let attr1 = try? FileManager.default.attributesOfItem(atPath: $1.path)
+                let date0 = attr0?[.creationDate] as? Date ?? Date.distantPast
+                let date1 = attr1?[.creationDate] as? Date ?? Date.distantPast
+                return date0 > date1
+            }
+
+            for fileURL in sortedURLs {
+                if let data = try? Data(contentsOf: fileURL),
+                   let image = UIImage(data: data) {
+                    let fileName = fileURL.deletingPathExtension().lastPathComponent
+                    if let uuid = UUID(uuidString: fileName) {
+                        images.append(GeneratedImage(id: uuid, image: image))
+                    }
+                }
+            }
+        } catch {
+            print("Error loading stickers: \(error)")
+        }
+        return images
+    }
+}
+
 class MessagesViewController: MSMessagesAppViewController {
 
     // MARK: - UI Components
@@ -53,11 +115,8 @@ class MessagesViewController: MSMessagesAppViewController {
     private lazy var collectionView: UICollectionView = {
         let layout = UICollectionViewFlowLayout()
         layout.scrollDirection = .vertical
-        layout.minimumInteritemSpacing = 4
-        layout.minimumLineSpacing = 4
-
-        let itemWidth = (UIScreen.main.bounds.width - 12) / 3
-        layout.itemSize = CGSize(width: itemWidth, height: itemWidth)
+        layout.minimumInteritemSpacing = 2
+        layout.minimumLineSpacing = 2
 
         let collectionView = UICollectionView(frame: .zero, collectionViewLayout: layout)
         collectionView.delegate = self
@@ -114,10 +173,18 @@ class MessagesViewController: MSMessagesAppViewController {
         searchBar.delegate = self
         submitButton.addTarget(self, action: #selector(submitButtonTapped), for: .touchUpInside)
 
-        // Show recents by default.
+        // Load recents from local storage.
+        recentImages = StickerStorageManager.shared.loadStickers()
         images = recentImages
         titleLabel.text = "Recents"
         collectionView.reloadData()
+    }
+
+    // When iMessage changes from compact to expanded (or vice versa),
+    // force the collection view to re-layout so it can show more columns if there's space.
+    override func willTransition(to presentationStyle: MSMessagesAppPresentationStyle) {
+        super.willTransition(to: presentationStyle)
+        collectionView.collectionViewLayout.invalidateLayout()
     }
 
     // MARK: - UI Setup
@@ -182,6 +249,7 @@ class MessagesViewController: MSMessagesAppViewController {
     private func showGeneratingScreen() {
         DispatchQueue.main.async {
             self.generatingView.isHidden = false
+            self.generatingLabel.text = "Generating..."
             self.activityIndicator.startAnimating()
         }
     }
@@ -214,7 +282,7 @@ class MessagesViewController: MSMessagesAppViewController {
                 }
                 
                 let body: [String: Any] = [
-                    "inputs": prompt,
+                    "inputs": prompt + " emoji",
                     "options": [
                         "wait_for_model": true
                     ]
@@ -242,12 +310,21 @@ class MessagesViewController: MSMessagesAppViewController {
                 if let contentType = httpResponse.value(forHTTPHeaderField: "Content-Type"),
                    contentType.contains("image/"),
                    let uiImage = UIImage(data: data) {
-                    
+
+                    // --- Update the label to "Removing Background" before calling remove.bg
+                    DispatchQueue.main.async {
+                        self.generatingLabel.text = "Removing Background"
+                    }
+
                     // Call remove.bg API to remove the background.
                     // If background removal fails, fall back to the original image.
                     let processedImage = await removeBackgroundUsingRemoveBg(for: uiImage) ?? uiImage
                     
                     let generated = GeneratedImage(id: UUID(), image: processedImage)
+                    
+                    // Save the newly generated sticker to local storage.
+                    StickerStorageManager.shared.saveSticker(image: processedImage, id: generated.id)
+                    
                     DispatchQueue.main.async {
                         // Add the new image to the beginning of recents.
                         self.recentImages.insert(generated, at: 0)
@@ -387,6 +464,8 @@ extension MessagesViewController: UICollectionViewDelegate, UICollectionViewData
         // Add to recent images if not already there.
         if !recentImages.contains(selected) {
             recentImages.append(selected)
+            // Optionally, re-save to local storage if needed.
+            StickerStorageManager.shared.saveSticker(image: selected.image, id: selected.id)
         }
         
         // Resize the image to help ensure it meets sticker file size requirements.
@@ -437,6 +516,47 @@ extension MessagesViewController: UICollectionViewDelegate, UICollectionViewData
         } catch {
             print("Error handling generated image: \(error)")
         }
+    }
+}
+
+// MARK: - UICollectionViewDelegateFlowLayout
+extension MessagesViewController: UICollectionViewDelegateFlowLayout {
+    
+    // Smaller insets for a tighter layout
+    func collectionView(_ collectionView: UICollectionView,
+                        layout collectionViewLayout: UICollectionViewLayout,
+                        insetForSectionAt section: Int) -> UIEdgeInsets {
+        // 2-point inset around the edges
+        return UIEdgeInsets(top: 2, left: 2, bottom: 2, right: 2)
+    }
+
+    // Spacing between rows
+    func collectionView(_ collectionView: UICollectionView,
+                        layout collectionViewLayout: UICollectionViewLayout,
+                        minimumLineSpacingForSectionAt section: Int) -> CGFloat {
+        return 2
+    }
+
+    // Spacing between items in a row
+    func collectionView(_ collectionView: UICollectionView,
+                        layout collectionViewLayout: UICollectionViewLayout,
+                        minimumInteritemSpacingForSectionAt section: Int) -> CGFloat {
+        return 2
+    }
+
+    // Dynamically choose 2 or 3 columns based on width
+    func collectionView(_ collectionView: UICollectionView,
+                        layout collectionViewLayout: UICollectionViewLayout,
+                        sizeForItemAt indexPath: IndexPath) -> CGSize {
+
+        let currentWidth = collectionView.bounds.width
+        let numberOfItemsPerRow: CGFloat = (currentWidth > 250) ? 3 : 2
+        let spacing: CGFloat = 2
+        let sectionInsets = self.collectionView(collectionView, layout: collectionViewLayout, insetForSectionAt: indexPath.section)
+        
+        let totalSpacing = (numberOfItemsPerRow - 1) * spacing + sectionInsets.left + sectionInsets.right
+        let cellWidth = (currentWidth - totalSpacing) / numberOfItemsPerRow
+        return CGSize(width: cellWidth, height: cellWidth)
     }
 }
 
